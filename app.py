@@ -188,9 +188,16 @@ def update_status():
 def login_user():
     data = request.get_json()
     email = data.get('email')
+    phone = data.get('phone')
     password = data.get('password')
+    login_identifier = phone or email
 
-    user = User.query.filter_by(email=email).first()
+    if not login_identifier or not password:
+        return jsonify({"error": "Phone/email and password are required"}), 400
+
+    user = User.query.filter(
+        (User.email == login_identifier) | (User.phone == login_identifier)
+    ).first()
     if not user or not user.check_password(password):
         return jsonify({"error": "Invalid credentials"}), 401
 
@@ -202,6 +209,7 @@ def login_user():
             "id": user.id,
             "name": user.name,
             "email": user.email,
+            "phone": user.phone,
             "role": user.role
         }
     }), 200
@@ -1242,4 +1250,4 @@ def get_journey_details(pickup_id):
 
 # Run server
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)

@@ -19,7 +19,20 @@ class User(db.Model):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
+        if not self.password_hash:
+            return False
+
+        stored_hash = self.password_hash.encode("utf-8")
+        if stored_hash.startswith(b"$2y$"):
+            stored_hash = b"$2b$" + stored_hash[4:]
+
+        if stored_hash.startswith((b"$2a$", b"$2b$", b"$2y$")):
+            import bcrypt
+
+            return bcrypt.checkpw(password.encode("utf-8"), stored_hash)
+
         from werkzeug.security import check_password_hash
+
         return check_password_hash(self.password_hash, password)
 
     def set_role(self, role):
