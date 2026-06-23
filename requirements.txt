@@ -1,6 +1,12 @@
-flask
-flask_sqlalchemy
-flask_cors
-mysql-connector-python
-requests
+flask==2.3.3
+flask_sqlalchemy==3.0.5
+flask_cors==4.0.0
+flask-jwt-extended==4.5.3
+flask-migrate==4.0.5
+python-dotenv==1.0.0
+werkzeug==2.3.7
+mysql-connector-python==8.1.0
+pymysql==1.1.0
+requests==2.31.0
 bcrypt
+gunicorn==21.2.0
