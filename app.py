@@ -27,6 +27,12 @@ DEFAULT_DATABASE_URL = (
 DATABASE_URL = os.getenv('DATABASE_URL', DEFAULT_DATABASE_URL)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 280,
+    'pool_size': 5,
+    'max_overflow': 10,
+}
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key')
 app.config['UPLOAD_FOLDER'] = 'uploads/images'
@@ -205,6 +211,8 @@ def update_status():
 
 @app.route('/api/login', methods=['POST'])
 def login_user():
+    from sqlalchemy.exc import OperationalError
+
     data = request.get_json()
     email = data.get('email')
     phone = data.get('phone')
@@ -214,9 +222,18 @@ def login_user():
     if not login_identifier or not password:
         return jsonify({"error": "Phone/email and password are required"}), 400
 
-    user = User.query.filter(
-        (User.email == login_identifier) | (User.phone == login_identifier)
-    ).first()
+    user = None
+    for attempt in range(2):
+        try:
+            user = User.query.filter(
+                (User.email == login_identifier) | (User.phone == login_identifier)
+            ).first()
+            break
+        except OperationalError:
+            db.session.rollback()
+            if attempt == 1:
+                return jsonify({"error": "Database connection error. Please try again."}), 503
+
     if not user or not user.check_password(password):
         return jsonify({"error": "Invalid credentials"}), 401
 
