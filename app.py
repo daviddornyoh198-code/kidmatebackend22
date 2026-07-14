@@ -3,7 +3,7 @@ from urllib.parse import urlparse, unquote
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -96,6 +96,45 @@ def get_children_for_parent(parent):
     except Exception:
         db.session.rollback()
         return Kid.query.filter_by(parent_id=parent.id).all()
+
+
+def fetch_grades_for_child(child_id):
+    try:
+        result = db.session.execute(
+            text("""
+                SELECT id, kid_id, subject, grade, remarks, comments, date_recorded, created_at
+                FROM grades
+                WHERE kid_id = :kid_id
+                ORDER BY date_recorded DESC, created_at DESC
+            """),
+            {"kid_id": child_id},
+        )
+        grade_records = []
+        for row in result.mappings():
+            record = dict(row)
+            if record.get('created_at'):
+                record['created_at'] = record['created_at'].isoformat()
+            if record.get('date_recorded'):
+                record['date_recorded'] = record['date_recorded'].isoformat()
+            grade_records.append(record)
+        return grade_records
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error fetching grades: {e}")
+        return []
+
+
+def serialize_parent(parent):
+    if not parent:
+        return None
+    return {
+        'id': parent.id,
+        'name': parent.name,
+        'phone': parent.phone,
+        'address': parent.address,
+        'occupation': parent.occupation,
+        'relationship': parent.relationship,
+    }
 
 
 def serialize_attendance(record):
@@ -306,25 +345,11 @@ def login_user():
 @jwt_required()
 def get_user_info():
     try:
-        current_user_email = get_jwt_identity()
-        user = User.query.filter_by(email=current_user_email).first()
-        
+        user, parent = get_user_and_parent()
+
         if not user:
             return jsonify({"error": "User not found"}), 404
-        
-        # Get parent information if user is linked to a parent
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
-        parent_info = None
-        if parent:
-            parent_info = {
-                'id': parent.id,
-                'name': parent.name,
-                'phone': parent.phone,
-                'address': parent.address,
-                'occupation': parent.occupation,
-                'relationship': parent.relationship
-            }
-        
+
         return jsonify({
             "success": True,
             "user": {
@@ -335,9 +360,9 @@ def get_user_info():
                 'role': user.role,
                 'image': user.image
             },
-            "parent": parent_info
+            "parent": serialize_parent(parent)
         })
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -449,19 +474,25 @@ def add_kid():
 @jwt_required()
 def assign_pickup():
     try:
+        user, parent = get_user_and_parent()
+        if not parent:
+            return jsonify({'error': 'Parent not found'}), 404
+
         data = request.form
         image_file = request.files.get('image')
 
         app.logger.debug(f"Received form data: {data}")
         app.logger.debug(f"Received image file: {image_file}")
 
-        # Assign defaults
         name = data.get('name', 'Unknown Person')
         pickup_id = data.get('pickup_id', '1234')
         kid_id = data.get('kid_id', '5')
 
-        image_path = save_image(image_file)
+        child = Kid.query.get(kid_id)
+        if not child or not child_belongs_to_parent(child, parent):
+            return jsonify({'error': 'Child not found or not authorized'}), 403
 
+        image_path = save_image(image_file)
         pickup_uuid = str(uuid.uuid4())
 
         person = PickupPerson(
@@ -475,7 +506,7 @@ def assign_pickup():
         db.session.add(person)
         db.session.commit()
 
-        pickup_url = f"https://5d4c3ae2bc3e.ngrok-free.app/pickup/{pickup_uuid}"
+        pickup_url = f"https://kidmatebackend22.onrender.com/pickup/{pickup_uuid}"
 
         app.logger.info(f"Pickup person added with UUID: {pickup_uuid}")
         return jsonify({
@@ -789,47 +820,21 @@ def get_child_attendance(child_id):
 def get_child_grades(child_id):
     """Get grade records for a specific child"""
     try:
-        current_user_email = get_jwt_identity()
-        user = User.query.filter_by(email=current_user_email).first()
-        
+        user, parent = get_user_and_parent()
+
         if not user:
             return jsonify({"error": "User not found"}), 404
-        
-        # Get parent associated with this user
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
-        
+
         if not parent:
             return jsonify({"error": "Parent not found for this user"}), 404
-        
-        # Verify the child belongs to this parent
-        child = Kid.query.filter_by(id=child_id, parent_id=parent.id).first()
-        
-        if not child:
+
+        child = Kid.query.filter_by(id=child_id).first()
+
+        if not child or not child_belongs_to_parent(child, parent):
             return jsonify({"error": "Child not found or not authorized"}), 404
-        
-        # Get grade records for this child
-        connection = get_pymysql_connection()
-        
-        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Get grade records for this child
-            sql = """
-                SELECT id, kid_id, subject, grade, remarks, comments, date_recorded, created_at
-                FROM grades 
-                WHERE kid_id = %s
-                ORDER BY date_recorded DESC, created_at DESC
-            """
-            cursor.execute(sql, (child_id,))
-            grade_records = cursor.fetchall()
-            
-            # Convert datetime objects to strings
-            for record in grade_records:
-                if record['created_at']:
-                    record['created_at'] = record['created_at'].isoformat()
-                if record['date_recorded']:
-                    record['date_recorded'] = record['date_recorded'].isoformat()
-        
-        connection.close()
-        
+
+        grade_records = fetch_grades_for_child(child_id)
+
         return jsonify({
             "success": True,
             "child": {
@@ -841,7 +846,7 @@ def get_child_grades(child_id):
             },
             "grade_records": grade_records
         })
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -887,38 +892,27 @@ def get_child_summary(child_id):
             'late_days': late_days,
         }
 
-        recent_grades = []
+        recent_grades = fetch_grades_for_child(child_id)[:1]
         grades_stats = {'total_grades': 0, 'average_grade': 0, 'lowest_grade': 0, 'highest_grade': 0}
         try:
-            connection = get_pymysql_connection()
-            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-                grades_sql = """
-                    SELECT id, subject, grade, remarks, date_recorded
-                    FROM grades 
-                    WHERE kid_id = %s
-                    AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-                    ORDER BY date_recorded DESC
-                    LIMIT 1
-                """
-                cursor.execute(grades_sql, (child_id,))
-                recent_grades = cursor.fetchall()
-
-                grades_stats_sql = """
-                    SELECT 
+            stats_result = db.session.execute(
+                text("""
+                    SELECT
                         COUNT(*) as total_grades,
                         AVG(CAST(grade AS DECIMAL(5,2))) as average_grade,
                         MIN(grade) as lowest_grade,
                         MAX(grade) as highest_grade
-                    FROM grades 
-                    WHERE kid_id = %s
+                    FROM grades
+                    WHERE kid_id = :kid_id
                     AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
                     AND grade REGEXP '^[0-9]+$'
-                """
-                cursor.execute(grades_stats_sql, (child_id,))
-                grades_stats = cursor.fetchone() or grades_stats
-            connection.close()
+                """),
+                {"kid_id": child_id},
+            )
+            grades_stats = dict(stats_result.mappings().first() or grades_stats)
         except Exception as e:
-            print(f"Error fetching grades: {e}")
+            db.session.rollback()
+            print(f"Error calculating grades stats: {e}")
         
         # Calculate attendance percentage
         attendance_percentage = 0
@@ -972,7 +966,7 @@ def submit_complaint():
         complaint_id = str(uuid.uuid4())
         
         # Get parent information
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        _, parent = get_user_and_parent()
         parent_id = parent.id if parent else None
         
         # Create complaint
@@ -1155,15 +1149,11 @@ def admin_update_complaint(complaint_id):
 @jwt_required()
 def get_pickup_persons():
     try:
-        current_user_email = get_jwt_identity()
-        
-        # Get the parent record for this user
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        _, parent = get_user_and_parent()
         if not parent:
             return jsonify({'error': 'Parent not found'}), 404
-        
-        # Get all kids for this parent
-        kids = Kid.query.filter_by(parent_id=parent.id).all()
+
+        kids = get_children_for_parent(parent)
         if not kids:
             return jsonify({
                 'success': True,
@@ -1202,25 +1192,19 @@ def get_pickup_persons():
 @jwt_required()
 def get_journey_details(pickup_id):
     try:
-        current_user_email = get_jwt_identity()
-        
-        # Get the parent record for this user
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
+        _, parent = get_user_and_parent()
         if not parent:
             return jsonify({'error': 'Parent not found'}), 404
-        
-        # Get the pickup person for this journey
+
         pickup_person = PickupPerson.query.filter_by(pickup_id=pickup_id).first()
         if not pickup_person:
             return jsonify({'error': 'Pickup person not found for this journey'}), 404
-        
-        # Get the child information
+
         child = Kid.query.get(pickup_person.kid_id)
         if not child:
             return jsonify({'error': 'Child not found'}), 404
-        
-        # Verify the child belongs to this parent
-        if child.parent_id != parent.id:
+
+        if not child_belongs_to_parent(child, parent):
             return jsonify({'error': 'Unauthorized access to this journey'}), 403
         
         # Get journey status from PickupJourney table
