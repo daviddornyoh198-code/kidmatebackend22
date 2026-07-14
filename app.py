@@ -3,6 +3,7 @@ from urllib.parse import urlparse, unquote
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+from sqlalchemy import or_
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -62,6 +63,56 @@ from models import PickupJourney, db, User, Parent, Kid, PickupPerson, Payment, 
 db.init_app(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+
+# --- Helpers ---
+
+def get_user_and_parent():
+    current_user_email = get_jwt_identity()
+    user = User.query.filter_by(email=current_user_email).first()
+    if not user:
+        return None, None
+
+    parent = Parent.query.filter_by(user_email=current_user_email).first()
+    if not parent and user.phone:
+        parent = Parent.query.filter_by(phone=user.phone).first()
+
+    return user, parent
+
+
+def child_belongs_to_parent(child, parent):
+    if not child or not parent:
+        return False
+    if child.parent_id == parent.id:
+        return True
+    parent2_id = getattr(child, 'parent2_id', None)
+    return parent2_id == parent.id
+
+
+def get_children_for_parent(parent):
+    try:
+        return Kid.query.filter(
+            or_(Kid.parent_id == parent.id, Kid.parent2_id == parent.id)
+        ).all()
+    except Exception:
+        db.session.rollback()
+        return Kid.query.filter_by(parent_id=parent.id).all()
+
+
+def serialize_attendance(record):
+    return {
+        'id': record.id,
+        'attendance_id': record.attendance_id,
+        'child_id': record.child_id,
+        'child_name': record.child_name,
+        'parent_id': record.parent_id,
+        'parent_name': record.parent_name,
+        'date': record.date.isoformat() if record.date else None,
+        'check_in_time': record.check_in_time.isoformat() if record.check_in_time else None,
+        'check_out_time': record.check_out_time.isoformat() if record.check_out_time else None,
+        'status': record.status,
+        'notes': record.notes,
+        'created_at': record.created_at.isoformat() if record.created_at else None,
+    }
 
 # --- Routes ---
 
@@ -657,20 +708,15 @@ def send_notification(token, message):
 def get_children():
     """Get all children for the authenticated parent user"""
     try:
-        current_user_email = get_jwt_identity()
-        user = User.query.filter_by(email=current_user_email).first()
-        
+        user, parent = get_user_and_parent()
+
         if not user:
             return jsonify({"error": "User not found"}), 404
-        
-        # Get parent associated with this user
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
-        
+
         if not parent:
             return jsonify({"error": "Parent not found for this user"}), 404
-        
-        # Get all children for this parent
-        children = Kid.query.filter_by(parent_id=parent.id).all()
+
+        children = get_children_for_parent(parent)
         
         children_list = []
         for child in children:
@@ -706,50 +752,23 @@ def get_children():
 def get_child_attendance(child_id):
     """Get attendance records for a specific child"""
     try:
-        current_user_email = get_jwt_identity()
-        user = User.query.filter_by(email=current_user_email).first()
-        
+        user, parent = get_user_and_parent()
+
         if not user:
             return jsonify({"error": "User not found"}), 404
-        
-        # Get parent associated with this user
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
-        
+
         if not parent:
             return jsonify({"error": "Parent not found for this user"}), 404
-        
-        # Verify the child belongs to this parent
-        child = Kid.query.filter_by(id=child_id, parent_id=parent.id).first()
-        
-        if not child:
+
+        child = Kid.query.filter_by(id=child_id).first()
+
+        if not child or not child_belongs_to_parent(child, parent):
             return jsonify({"error": "Child not found or not authorized"}), 404
-        
-        # Get attendance records for this child
-        connection = get_pymysql_connection()
-        
-        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Get attendance records for this child
-            sql = """
-                SELECT id, attendance_id, child_id, child_name, parent_id, parent_name, 
-                       date, check_in_time, check_out_time, status, notes, created_at
-                FROM attendance 
-                WHERE child_id = %s OR child_name = %s
-                ORDER BY date DESC, created_at DESC
-            """
-            cursor.execute(sql, (str(child_id), child.name))
-            attendance_records = cursor.fetchall()
-            
-            # Convert datetime objects to strings
-            for record in attendance_records:
-                if record['created_at']:
-                    record['created_at'] = record['created_at'].isoformat()
-                if record['check_in_time']:
-                    record['check_in_time'] = record['check_in_time'].isoformat()
-                if record['check_out_time']:
-                    record['check_out_time'] = record['check_out_time'].isoformat()
-        
-        connection.close()
-        
+
+        attendance_records = Attendance.query.filter(
+            or_(Attendance.child_id == str(child_id), Attendance.child_name == child.name)
+        ).order_by(Attendance.date.desc(), Attendance.created_at.desc()).all()
+
         return jsonify({
             "success": True,
             "child": {
@@ -759,9 +778,9 @@ def get_child_attendance(child_id):
                 'grade': child.grade,
                 'school': child.school
             },
-            "attendance_records": attendance_records
+            "attendance_records": [serialize_attendance(record) for record in attendance_records]
         })
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -831,98 +850,75 @@ def get_child_grades(child_id):
 def get_child_summary(child_id):
     """Get comprehensive summary for a child including attendance and grades"""
     try:
-        current_user_email = get_jwt_identity()
-        user = User.query.filter_by(email=current_user_email).first()
-        
+        user, parent = get_user_and_parent()
+
         if not user:
             return jsonify({"error": "User not found"}), 404
-        
-        # Get parent associated with this user
-        parent = Parent.query.filter_by(user_email=current_user_email).first()
-        
+
         if not parent:
             return jsonify({"error": "Parent not found for this user"}), 404
-        
-        # Verify the child belongs to this parent
-        child = Kid.query.filter_by(id=child_id, parent_id=parent.id).first()
-        
-        if not child:
+
+        child = Kid.query.filter_by(id=child_id).first()
+
+        if not child or not child_belongs_to_parent(child, parent):
             return jsonify({"error": "Child not found or not authorized"}), 404
-        
-        # Get attendance and grades data
-        connection = get_pymysql_connection()
-        
-        with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Get recent attendance (last 30 days)
-            attendance_sql = """
-                SELECT id, date, status, check_in_time, check_out_time, notes
-                FROM attendance 
-                WHERE (child_id = %s OR child_name = %s)
-                AND date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-                ORDER BY date DESC
-                LIMIT 1
-            """
-            try:
-                cursor.execute(attendance_sql, (str(child_id), child.name))
-                recent_attendance = cursor.fetchall()
-            except Exception as e:
-                print(f"Error fetching attendance: {e}")
-                recent_attendance = []
-            
-            # Get recent grades (last 6 months)
-            grades_sql = """
-                SELECT id, subject, grade, remarks, date_recorded
-                FROM grades 
-                WHERE kid_id = %s
-                AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-                ORDER BY date_recorded DESC
-                LIMIT 1
-            """
-            try:
+
+        from datetime import date, timedelta
+        thirty_days_ago = date.today() - timedelta(days=30)
+
+        recent_attendance = Attendance.query.filter(
+            or_(Attendance.child_id == str(child_id), Attendance.child_name == child.name),
+            Attendance.date >= thirty_days_ago
+        ).order_by(Attendance.date.desc()).limit(1).all()
+
+        attendance_stats_query = Attendance.query.filter(
+            or_(Attendance.child_id == str(child_id), Attendance.child_name == child.name),
+            Attendance.date >= thirty_days_ago
+        ).all()
+
+        total_days = len(attendance_stats_query)
+        present_days = sum(1 for r in attendance_stats_query if (r.status or '').lower() in ('present', 'checked in'))
+        absent_days = sum(1 for r in attendance_stats_query if (r.status or '').lower() == 'absent')
+        late_days = sum(1 for r in attendance_stats_query if (r.status or '').lower() == 'late')
+        attendance_stats = {
+            'total_days': total_days,
+            'present_days': present_days,
+            'absent_days': absent_days,
+            'late_days': late_days,
+        }
+
+        recent_grades = []
+        grades_stats = {'total_grades': 0, 'average_grade': 0, 'lowest_grade': 0, 'highest_grade': 0}
+        try:
+            connection = get_pymysql_connection()
+            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                grades_sql = """
+                    SELECT id, subject, grade, remarks, date_recorded
+                    FROM grades 
+                    WHERE kid_id = %s
+                    AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+                    ORDER BY date_recorded DESC
+                    LIMIT 1
+                """
                 cursor.execute(grades_sql, (child_id,))
                 recent_grades = cursor.fetchall()
-            except Exception as e:
-                print(f"Error fetching grades: {e}")
-                recent_grades = []
-            
-            # Calculate attendance statistics
-            attendance_stats_sql = """
-                SELECT 
-                    COUNT(*) as total_days,
-                    SUM(CASE WHEN status IN ('Present', 'Checked In') THEN 1 ELSE 0 END) as present_days,
-                    SUM(CASE WHEN status = 'Absent' THEN 1 ELSE 0 END) as absent_days,
-                    SUM(CASE WHEN status = 'Late' THEN 1 ELSE 0 END) as late_days
-                FROM attendance 
-                WHERE (child_id = %s OR child_name = %s)
-                AND date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-            """
-            try:
-                cursor.execute(attendance_stats_sql, (str(child_id), child.name))
-                attendance_stats = cursor.fetchone()
-            except Exception as e:
-                print(f"Error calculating attendance stats: {e}")
-                attendance_stats = {'total_days': 0, 'present_days': 0, 'absent_days': 0, 'late_days': 0}
-            
-            # Calculate grade statistics
-            grades_stats_sql = """
-                SELECT 
-                    COUNT(*) as total_grades,
-                    AVG(CAST(grade AS DECIMAL(5,2))) as average_grade,
-                    MIN(grade) as lowest_grade,
-                    MAX(grade) as highest_grade
-                FROM grades 
-                WHERE kid_id = %s
-                AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
-                AND grade REGEXP '^[0-9]+$'
-            """
-            try:
+
+                grades_stats_sql = """
+                    SELECT 
+                        COUNT(*) as total_grades,
+                        AVG(CAST(grade AS DECIMAL(5,2))) as average_grade,
+                        MIN(grade) as lowest_grade,
+                        MAX(grade) as highest_grade
+                    FROM grades 
+                    WHERE kid_id = %s
+                    AND date_recorded >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+                    AND grade REGEXP '^[0-9]+$'
+                """
                 cursor.execute(grades_stats_sql, (child_id,))
-                grades_stats = cursor.fetchone()
-            except Exception as e:
-                print(f"Error calculating grades stats: {e}")
-                grades_stats = {'total_grades': 0, 'average_grade': 0, 'lowest_grade': 0, 'highest_grade': 0}
-        
-        connection.close()
+                grades_stats = cursor.fetchone() or grades_stats
+            connection.close()
+        except Exception as e:
+            print(f"Error fetching grades: {e}")
         
         # Calculate attendance percentage
         attendance_percentage = 0
@@ -938,7 +934,7 @@ def get_child_summary(child_id):
                 'grade': child.grade,
                 'school': child.school
             },
-            "recent_attendance": recent_attendance,
+            "recent_attendance": [serialize_attendance(record) for record in recent_attendance],
             "recent_grades": recent_grades,
             "attendance_stats": {
                 'total_days': attendance_stats['total_days'] if attendance_stats else 0,

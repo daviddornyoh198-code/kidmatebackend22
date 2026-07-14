@@ -61,6 +61,7 @@ class Kid(db.Model):
     school = db.Column(db.String(100))
     image = db.Column(db.String(255))
     parent_id = db.Column(db.Integer, db.ForeignKey('parents.id'))
+    parent2_id = db.Column(db.Integer, db.ForeignKey('parents.id'), nullable=True)
     created_at = db.Column(db.DateTime, server_default=func.current_timestamp())
 
 
