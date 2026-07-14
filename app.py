@@ -1,4 +1,5 @@
 import os
+from urllib.parse import urlparse, unquote
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 from flask_migrate import Migrate
 import requests
 import uuid
+import pymysql
 from datetime import datetime
 
 # Load environment variables
@@ -19,10 +21,11 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
-    'DATABASE_URL',
-    'mysql+pymysql://root:root@localhost:8889/kidmate_db',
+DEFAULT_DATABASE_URL = (
+    'mysql+pymysql://u919251671_kidmate@srv1941.hstgr.io:3306/u919251671_kidmate'
 )
+DATABASE_URL = os.getenv('DATABASE_URL', DEFAULT_DATABASE_URL)
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-secret-key')
@@ -32,6 +35,18 @@ app.config['UPLOAD_FOLDER'] = 'uploads/images'
 app.config['JWT_TOKEN_LOCATION'] = ['headers']
 app.config['JWT_HEADER_NAME'] = 'Authorization'
 app.config['JWT_HEADER_TYPE'] = 'Bearer'
+
+
+def get_pymysql_connection():
+    url = DATABASE_URL.replace('mysql+pymysql://', 'mysql://', 1)
+    parsed = urlparse(url)
+    return pymysql.connect(
+        host=parsed.hostname,
+        port=parsed.port or 3306,
+        user=unquote(parsed.username or ''),
+        password=unquote(parsed.password or ''),
+        database=parsed.path.lstrip('/'),
+    )
 
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -693,16 +708,7 @@ def get_child_attendance(child_id):
             return jsonify({"error": "Child not found or not authorized"}), 404
         
         # Get attendance records for this child
-        import pymysql
-        
-        # Connect to database
-        connection = pymysql.connect(
-            host='localhost',
-            port=8889,
-            user='root',
-            password='root',
-            database='kidmate_db'
-        )
+        connection = get_pymysql_connection()
         
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
             # Get attendance records for this child
@@ -766,16 +772,7 @@ def get_child_grades(child_id):
             return jsonify({"error": "Child not found or not authorized"}), 404
         
         # Get grade records for this child
-        import pymysql
-        
-        # Connect to database
-        connection = pymysql.connect(
-            host='localhost',
-            port=8889,
-            user='root',
-            password='root',
-            database='kidmate_db'
-        )
+        connection = get_pymysql_connection()
         
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
             # Get grade records for this child
@@ -836,15 +833,7 @@ def get_child_summary(child_id):
             return jsonify({"error": "Child not found or not authorized"}), 404
         
         # Get attendance and grades data
-        import pymysql
-        
-        connection = pymysql.connect(
-            host='localhost',
-            port=8889,
-            user='root',
-            password='root',
-            database='kidmate_db'
-        )
+        connection = get_pymysql_connection()
         
         with connection.cursor(pymysql.cursors.DictCursor) as cursor:
             # Get recent attendance (last 30 days)
