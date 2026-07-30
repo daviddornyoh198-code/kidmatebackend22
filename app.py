@@ -3,7 +3,7 @@ from urllib.parse import urlparse, unquote
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from sqlalchemy import or_, text
+from sqlalchemy import or_, text, func
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -137,6 +137,30 @@ def serialize_parent(parent):
     }
 
 
+def normalize_attendance_status(status):
+    if not status:
+        return None
+    normalized = status.strip().lower()
+    status_map = {
+        'present': 'Present',
+        'checked in': 'Present',
+        'absent': 'Absent',
+        'late': 'Late',
+        'early_dismissal': 'Early Dismissal',
+        'excused': 'Excused',
+        'checked out': 'Checked Out',
+    }
+    return status_map.get(normalized, status.strip().title())
+
+
+def attendance_filter_for_child(child):
+    child_ids = {str(child.id), f"CHILD{child.id}"}
+    clauses = [Attendance.child_id.in_(child_ids)]
+    if child.name:
+        clauses.append(func.lower(Attendance.child_name) == child.name.lower().strip())
+    return or_(*clauses)
+
+
 def serialize_attendance(record):
     return {
         'id': record.id,
@@ -148,7 +172,7 @@ def serialize_attendance(record):
         'date': record.date.isoformat() if record.date else None,
         'check_in_time': record.check_in_time.isoformat() if record.check_in_time else None,
         'check_out_time': record.check_out_time.isoformat() if record.check_out_time else None,
-        'status': record.status,
+        'status': normalize_attendance_status(record.status),
         'notes': record.notes,
         'created_at': record.created_at.isoformat() if record.created_at else None,
     }
@@ -797,7 +821,7 @@ def get_child_attendance(child_id):
             return jsonify({"error": "Child not found or not authorized"}), 404
 
         attendance_records = Attendance.query.filter(
-            or_(Attendance.child_id == str(child_id), Attendance.child_name == child.name)
+            attendance_filter_for_child(child)
         ).order_by(Attendance.date.desc(), Attendance.created_at.desc()).all()
 
         return jsonify({
@@ -872,12 +896,11 @@ def get_child_summary(child_id):
         thirty_days_ago = date.today() - timedelta(days=30)
 
         recent_attendance = Attendance.query.filter(
-            or_(Attendance.child_id == str(child_id), Attendance.child_name == child.name),
-            Attendance.date >= thirty_days_ago
-        ).order_by(Attendance.date.desc()).limit(1).all()
+            attendance_filter_for_child(child)
+        ).order_by(Attendance.date.desc(), Attendance.created_at.desc()).limit(1).all()
 
         attendance_stats_query = Attendance.query.filter(
-            or_(Attendance.child_id == str(child_id), Attendance.child_name == child.name),
+            attendance_filter_for_child(child),
             Attendance.date >= thirty_days_ago
         ).all()
 
